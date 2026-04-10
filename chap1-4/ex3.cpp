@@ -58,7 +58,6 @@
 // 3. `empty()` phải lock mutex — điều này không phá vỡ `const` semantics không?
 // Giải thích vai trò của `mutable`.
 //
-#include <algorithm>
 #include <exception>
 #include <functional>
 #include <iostream>
@@ -79,7 +78,7 @@ template <typename T>
 class thread_safe_stack {
    private:
     std::stack<T> m_stack;
-    std::mutex m_mutex;
+    mutable std::mutex m_mutex;
 
    public:
     thread_safe_stack() : m_stack{}, m_mutex{} {}
@@ -100,11 +99,11 @@ class thread_safe_stack {
         ret = m_stack.top();
         m_stack.pop();
     }
-    bool empty() {
+    bool const empty() {
         std::lock_guard<std::mutex> g(m_mutex);
         return m_stack.empty();
     }
-    void push(T& item) {
+    void push(T item) {
         std::lock_guard<std::mutex> g(m_mutex);
         m_stack.push(item);
     }
@@ -132,7 +131,7 @@ int main() {
                         try {
                             auto ret = stack.pop();
                             std::cout << *ret.get() << "\n";
-                        } catch (std::exception e) {
+                        } catch (std::exception& e) {
                             std::cout << e.what();
                         }
                     }
