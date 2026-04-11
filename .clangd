@@ -1,3 +1,3 @@
 # .clangd
 CompileFlags:
-  Add: [-std=c++20]   # or -std=c++23 for C++23 features
+  Add: [-std=c++20, -pthread, -fsanitize=thread, -fno-omit-frame-pointer, -g]   # or -std=c++23 for C++23 features
