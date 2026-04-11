@@ -200,15 +200,15 @@ void test() {
     for (int i = 0; i < 5; ++i) {
         v_consumers.emplace_back(std::thread([&] {
             while (1) {
-                LOG << count << "\n";
+                LOG << "\n";
                 try {
-                    if (count == 3000) return;
                     int temp = *queue.try_pop().get();
                     std::lock_guard<std::mutex> g(mx_sum);
                     sum += temp;
-                    if (count.fetch_add(1) + 1 >= 3000) return;
+                    count.fetch_add(1);
                 } catch (const std::exception& e) {
                     LOG << e.what();
+                    return;
                 }
             }
         }));
@@ -254,16 +254,13 @@ void test2() {
             while (1) {
                 LOG << count << "\n";
                 try {
-                    if (count == 3000) {
-                        queue.shutdown();
-                        return;
-                    } 
                     int temp = *queue.wait_and_pop().get();
                     std::lock_guard<std::mutex> g(mx_sum);
                     sum += temp;
-                    if (count.fetch_add(1) + 1 >= 3000) return;
+                    count.fetch_add(1);
                 } catch (const std::exception& e) {
-                    LOG << e.what();
+                    LOG << e.what() << "\n";
+                    return;
                 }
             }
         }));
