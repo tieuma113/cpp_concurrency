@@ -87,14 +87,14 @@ void run(std::string_view sv_input) {
         //  string vector
         std::vector<std::string> vec_ret;
         ssize_t pos = sv_input.find(' ');
-        ssize_t pre = 0;
-        while (pos != std::string_view::npos) {
-            std::string_view sv_temp = sv_input.substr(pre, pos - pre); 
+        ssize_t pre = -1;
+        do {
+            std::string_view sv_temp = sv_input.substr(pre+1, pos - pre); 
             std::cout << sv_temp << "\t";
             vec_ret.emplace_back(sv_temp);
-            pre = pos + 1;
-            pos = sv_input.find(' ', pre);
-        }
+            pre = pos;
+            pos = sv_input.find(' ', pre+1);
+        }while ( pre != std::string_view::npos);
 
         std::cout << "\n";
         prom_stage1.set_value(vec_ret);
