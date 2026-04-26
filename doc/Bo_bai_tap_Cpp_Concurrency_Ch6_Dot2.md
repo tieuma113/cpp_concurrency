@@ -1,473 +1,504 @@
-# Bộ bài tập chuyên sâu — C++ Concurrency in Action, Chapter 6 (Đợt 2)
-
-> **Đối tượng**: lock-based concurrent data structures (stack, queue with fine-grained locking, hash-bucketed lookup table, fine-node-locked linked list).
-> **Mục tiêu**: kéo từ L3 (Apply) lên L4–L5 (Analyze/Evaluate). Tránh các góc đã drill ở đợt trước (move ops self-assignment, interface race của `top()/pop()`).
-> **Toolchain**: `g++ -std=c++17 -pthread -g -fsanitize=thread`.
-
----
-
-## (0) Foundational warm-up — vẽ và liệt kê
-
-Không phải định nghĩa. Đây là bài kiểm tra "trong đầu có hình không".
-
-### W1. ASCII diagram queue dummy node (listing 6.6)
-
-Vẽ trạng thái queue tại 4 thời điểm sau:
-1. Sau constructor (queue rỗng).
-2. Sau `push(A)`.
-3. Sau `push(B)`.
-4. Sau `try_pop()` (kết quả: `A`).
-
-Mỗi node phải thể hiện rõ: ô `data` (con trỏ), ô `next` (con trỏ), và `head`/`tail` đang trỏ vào đâu. Đặc biệt: chỉ ra ô `data` của dummy node là gì ở mỗi bước.
-
-### W2. Liệt kê đúng 5 invariant của `threadsafe_queue` (listing 6.7–6.10)
-
-Yêu cầu: mỗi invariant phải nói được "luôn đúng" tại điểm nào trong code (đầu/cuối hàm, hay xuyên suốt). Tối đa 1 dòng mỗi invariant.
-
-Ví dụ của một invariant đúng dạng:
-> *"Tại mọi thời điểm có lock `head_mutex` được giải phóng, `head` trỏ tới một node hợp lệ (không null) thuộc danh sách hiện tại."*
-
-### W3. Bảng 4 cột — primitive nào, ở đâu, vì sao
-
-| Listing  | Primitive       | Bảo vệ cái gì                    | Vì sao chọn primitive đó (1 câu) |
-|---------:|-----------------|----------------------------------|----------------------------------|
-| 6.1 stack| `std::mutex`    |                                  |                                  |
-| 6.2 queue| `mutex` + `cv`  |                                  |                                  |
-| 6.6 queue| 2× `mutex`      |                                  |                                  |
-| 6.11 map | `shared_mutex`  |                                  |                                  |
-| 6.13 list| `mutex` per node|                                  |                                  |
+# Bài tập thực hành — C++ Concurrency in Action (Ch. 6)
+# Designing Lock-Based Concurrent Data Structures
+> Tự thiết kế & implement từ đầu đến cuối.  
+> Build: `g++ -std=c++17 -pthread -g -fsanitize=thread -fsanitize=address`
 
 ---
 
-## (1) Câu hỏi tự luận chuyên sâu
+## Cách dùng bộ bài tập này
 
-Format chuẩn: **Context → State/Interleaving → Primitive → Invariant → Trade-off → Edge case**.
+Mỗi bài có:
+- **Đặc tả hành vi** — mô tả chính xác hệ thống phải làm gì
+- **Ràng buộc cứng** — những gì bắt buộc hoặc cấm
+- **Invariant cần giữ** — tính đúng đắn được định nghĩa thế nào
+- **Debug checkpoint** — những điểm thường sai, để kiểm tra sau khi xong
+- **Câu hỏi phân tích** — phải trả lời được sau khi implement xong
 
-### E1 🔴 — `get_tail()` phải gọi BÊN TRONG `head_mutex` lock
+Không có skeleton code. Không có gợi ý cấu trúc class.
+Tự thiết kế interface trước khi viết implementation.
 
-Trong listing 6.6, hàm `pop_head()` lock `head_mutex` rồi mới gọi `get_tail()` (hàm này tự lock `tail_mutex`). Có vẻ thừa: tại sao không gọi `get_tail()` trước khi lock `head_mutex` để giảm critical section?
+**Lưu ý:** Bộ bài tập này KHÔNG trùng với bộ Ch. 2–4. Các bài ở đây tập trung vào kỹ thuật đặc trưng của Ch. 6: fine-grained locking, dummy node separation, per-bucket locking, và hand-over-hand locking.
 
-Yêu cầu:
-- (a) Dựng kịch bản cụ thể với **3 threads** (T1 đang pop, T2 và T3 đang push) chứng minh nếu đảo thứ tự (gọi `get_tail()` ngoài lock), `head` có thể bị di chuyển vượt qua node mà `get_tail()` trả về, dẫn đến destruction một node "vô chủ".
-- (b) Vẽ ASCII linked list trước/sau interleaving để minh họa.
-- (c) Nêu chính xác invariant nào bị break, và vì sao thứ tự lock đúng (head trước, tail sau khi đã có head_lock) **giữ** invariant đó.
-- (d) Hệ quả lock ordering này có rủi ro deadlock không khi push() lock theo chiều ngược (tail trước)? Giải thích vì sao không.
+---
 
-### E2 🔴 — Exception safety của `push()` trong listing 6.8
+# PHẦN A — Fine-Grained Locking Queue
 
-Liệt kê **theo thứ tự thực thi** mọi điểm có thể throw exception. Với mỗi điểm:
-- Loại exception nào (allocation, copy ctor, move ctor, lock acquisition…).
-- Trạng thái queue ngay tại điểm đó (đã thay đổi member chưa? lock đã giữ chưa?).
-- Cleanup tự động bởi cái gì (RAII, smart pointer destructor…).
-- Guarantee đạt được (basic / strong / nothrow).
+---
 
-Sau đó: chứng minh `push()` đạt **strong exception guarantee** (queue trông như chưa từng được gọi). Lưu ý đặc biệt: `tail->data = new_data;` có thể throw không? Điểm mấu chốt nằm ở chỗ nào?
+## Bài 8 🟡 — `fine_queue<T>`: Queue với dummy node và tách head/tail mutex
 
-### E3 🟡 — `notify_one()` đặt trong hay ngoài lock
+### Đặc tả hành vi
 
-Listing 6.8 gọi `data_cond.notify_one()` **sau khi** `tail_mutex` được giải phóng (lock_guard ra khỏi scope nội). Một biến thể "naive" giữ lock khi notify:
-```cpp
-void push(T new_value) {
-    auto new_data = std::make_shared<T>(std::move(new_value));
-    std::unique_ptr<node> p(new node);
-    std::lock_guard<std::mutex> lk(tail_mutex);
-    tail->data = new_data;
-    tail->next = std::move(p);
-    tail = tail->next.get();
-    data_cond.notify_one();   // <-- vẫn trong lock
-}
+Viết class template `fine_queue<T>` dưới dạng singly linked list, với hai mutex tách biệt bảo vệ head và tail. Queue sử dụng kỹ thuật **dummy node** để tách biệt hoàn toàn vùng truy cập của push và pop.
+
+Interface:
+
+```
+push(T value)
+try_pop() -> std::shared_ptr<T>
+try_pop(T& out) -> bool
+empty() -> bool
 ```
 
-Yêu cầu:
-- (a) Vẽ ASCII timeline 2 threads (Producer P, Consumer C đang chờ trong `wait_and_pop`) cho **cả hai** phiên bản. Thể hiện rõ trạng thái lock của P và trạng thái wait/wake của C tại từng tick.
-- (b) Phiên bản nào tốt hơn về throughput, và vì sao? Trade-off cụ thể là gì?
-- (c) **Twist**: notify_one trong `threadsafe_queue` này thực ra dùng `head_mutex` ở phía consumer chứ không phải `tail_mutex`. Vậy việc giữ `tail_mutex` khi notify thực sự gây hại không? Phân tích lại.
+Yêu cầu thiết kế:
+1. Linked list nội bộ luôn có ít nhất một node (dummy node). Queue rỗng ⟺ `head == tail`, cả hai trỏ vào dummy node.
+2. `push()` chỉ lock `tail_mutex`. `try_pop()` lock `head_mutex`, và chỉ lock `tail_mutex` trong thời gian rất ngắn để đọc `tail`.
+3. Data được lưu bằng `std::shared_ptr<T>` trong node. Dummy node có `data == nullptr`.
+4. `push()` phải thực hiện memory allocation (`make_shared`, `new node`) **trước** khi acquire lock.
+5. Mỗi node sở hữu node tiếp theo qua `std::unique_ptr<node>`.
 
-### E4 🔴 — Tại sao `num_buckets` cố định lúc khởi tạo (listing 6.11)
+### Ràng buộc cứng
 
-`std::unordered_map` có rehash để giữ load factor thấp. Listing 6.11 thì không. Yêu cầu phân tích:
-- (a) Tại sao mặc định 19? Nói chính xác lợi ích của số nguyên tố với hash modulo.
-- (b) Nếu insert 1 triệu key duy nhất vào bảng 19 bucket, `value_for(key)` worst-case là O(?). So với `std::unordered_map`?
-- (c) Vì sao không thể dễ dàng thêm rehash? Cụ thể: nếu thread T1 đang giữ `bucket[5].mutex` đọc, thread T2 trigger rehash → toàn bộ buckets bị tái phân phối → `bucket[5]` không còn tồn tại ở vị trí cũ. Liệt kê 3 vấn đề cụ thể (lifetime, lock identity, iterator/reference invalidation).
-- (d) Thiết kế thay thế: nếu PHẢI hỗ trợ rehash, bạn dùng cơ chế gì? Gợi ý các từ khoá: epoch-based, RCU-style, generation counter, double-buffered table. Chọn 1 và phác sơ đồ.
+- **Không dùng `std::queue`**, `std::deque`, hay bất kỳ container nào bên trong. Tự viết linked list.
+- **Không dùng condition variable** trong bài này — chỉ pure try-based interface.
+- Đúng hai mutex: `head_mutex` và `tail_mutex`. Không thêm mutex thứ ba.
+- `tail` là raw pointer (`node*`), `head` là `std::unique_ptr<node>`.
 
-### E5 🔴 — `get_map()` (listing 6.12): snapshot có "atomic" không?
+### Invariant cần giữ
 
-Code lock TẤT CẢ bucket mutexes (`unique_lock`) rồi mới copy.
+- `tail->next == nullptr` luôn đúng.
+- `tail->data == nullptr` luôn đúng (tail luôn là dummy).
+- `head == tail` ⟺ queue rỗng.
+- Với mỗi node `x` trong list mà `x != tail`: `x->data != nullptr` và `x->next` trỏ đến node tiếp theo.
+- Đi theo `next` từ `head` cuối cùng đến `tail`.
 
-- (a) Đây là atomic snapshot theo nghĩa nào? Định nghĩa "atomic snapshot" cho lookup table.
-- (b) Trong khi `get_map()` chạy, một thread call `value_for(key)` block bao lâu? Worst case so với best case?
-- (c) **Phương án B**: lock bucket 1 → copy → unlock; lock bucket 2 → copy → unlock; … (lock từng bucket ngắn hạn). Đặt câu hỏi: kết quả `std::map` trả về có còn "đúng" không? "Đúng" theo nghĩa nào? Có bị mất key không? Có chứa key đã bị remove không? Có vi phạm bất kỳ invariant cấu trúc nào không?
-- (d) Trong production (lookup table chứa millions of entries, `get_map()` được gọi cho diagnostic dump), bạn sẽ chọn A hay B? Lý do.
+### Bài test bắt buộc
 
-### E6 🔴 — Hand-over-hand list (listing 6.13): có thể có 2 iteration concurrent không?
+4 producer threads, mỗi thread push 50,000 giá trị (`int`). 4 consumer threads, mỗi thread `try_pop` trong loop cho đến khi tổng cộng đã pop 200,000 elements (dùng `std::atomic<int>` đếm). Sau khi join: tổng giá trị pop ra phải bằng tổng giá trị đã push.
 
-Sách viết: *"the mutex for each node must be locked in turn, the threads can't pass each other"*. Phân tích cụ thể:
+### Debug checkpoint
 
-- (a) Thread A và Thread B cùng gọi `for_each(f)` — tức cùng chiều, đầu danh sách trở đi. Vẽ ASCII timeline node-by-node. Có deadlock không? Có concurrency không hay full-serial?
-- (b) Thread A đang `for_each` (đi từ đầu), thread B đang... cũng chỉ đi được từ đầu (list không có double-link). Vậy B có thể "đi ngược chiều" theo nghĩa nào? Cấu trúc có loại trừ deadlock không? Lý do.
-- (c) Thread A `remove_if(pred)` đang giữ lock(node_3) muốn lock(node_4). Thread B `for_each` đang giữ lock(node_3)? Không thể — vì sao? Mô tả handover protocol chính xác (lock current, lock next, release prev — thứ tự đầy đủ).
-- (d) **Edge case**: thread A xoá node_4 trong khi thread B đang giữ lock(node_4). Có happen được không? Chứng minh không, dựa trên handover protocol.
-- (e) Hệ quả thực tế: nếu một `for_each` callback chạy 10ms ở node_5, mọi thread khác phải đợi tối thiểu bao lâu để **đi qua** node_5? Đây có phải fine-grained locking thật sự không?
+- Chạy `-fsanitize=thread`. Nếu có report → sai. Đặc biệt chú ý data race trên `tail` — đọc `tail` trong `try_pop` **phải** lock `tail_mutex`.
+- Nếu `get_tail()` được gọi **ngoài** scope của `head_mutex` → có thể `head` bị di chuyển quá `tail` cũ. Trace interleaving cụ thể.
+- Khi queue có đúng 1 element: `head->next` là dummy, `head != tail`. Pop phải đưa `head` sang dummy. Sau pop: `head == tail`, queue rỗng.
 
----
+### Câu hỏi phân tích
 
-## (2) Câu hỏi cross-chapter
-
-### C1 🔴 — Memory ordering (chap 5) trong queue listing 6.6
-
-Một junior developer hỏi:
-> *"`tail` là `node*` raw pointer, được đọc/ghi từ nhiều threads. Sao không phải `std::atomic<node*>`? Như vậy có data race không?"*
-
-Yêu cầu trả lời như interview:
-- (a) Định nghĩa **data race** chính xác (theo C++ memory model: hai access đến cùng location, ít nhất một là write, không có happens-before).
-- (b) Mutex lock/unlock cung cấp synchronization gì? Cụ thể: `lock()` đóng vai trò gì về memory ordering? `unlock()` đóng vai trò gì? Tham chiếu acquire/release.
-- (c) Áp dụng vào listing 6.6: chứng minh KHÔNG có data race trên `tail` mặc dù là raw pointer. Vẽ happens-before edges giữa hai threads (P push, C try_pop).
-- (d) Điều kiện gì sẽ phá vỡ chứng minh trên? (Gợi ý: nếu một function nào đó đọc `tail` mà không lock `tail_mutex`?)
-
-### C2 🟡 — Lock ordering deadlock (chap 3) trong queue 2-mutex
-
-- (a) Trong nội bộ `threadsafe_queue` listing 6.6, có bao giờ giữ đồng thời 2 mutex (head + tail)? Chỉ ra hàm cụ thể.
-- (b) Lock order trong hàm đó là gì? Nếu user code trực tiếp lock 2 mutex theo chiều ngược lại — họ có cách nào không? (Hint: 2 mutex là `private`.)
-- (c) `std::lock(m1, m2)` từ chap 3 có cần thiết ở đây không? Vì sao?
-- (d) Giả sử ai đó thêm hàm `transfer(other_queue&)` di chuyển N items qua queue khác. Phân tích deadlock risk và đề xuất cách viết đúng.
-
-### C3 🔴 — Condition variable predicate (chap 4) gọi function tự lock
-
-`wait_for_data()` (listing 6.9) wait với predicate `head.get() != get_tail()`. `get_tail()` tự lock `tail_mutex`.
-
-- (a) `cv.wait(lk, pred)` — pred được gọi khi nào? Liệt kê đầy đủ các thời điểm (initial entry, sau spurious wakeup, sau notify_one).
-- (b) Tại mỗi lần gọi pred, lock state của `head_mutex` là gì? Của `tail_mutex` là gì?
-- (c) Nguy cơ deadlock: thread T1 đang trong `wait()` (giữ `head_mutex` trong lúc check pred, đang lock `tail_mutex` cho `get_tail()`). Thread T2 muốn lock cả hai theo chiều khác — có không? Trace cụ thể.
-- (d) Performance: pred gọi `get_tail()` mỗi lần wakeup → mỗi lần đều phải lock/unlock `tail_mutex`. Có ảnh hưởng không? Có cách nào "cache" lại không (và lý do tại sao không nên)?
-
-### C4 🟡 — Stack listing 6.1 vs queue listing 6.6: vì sao không phân tách 2 mutex cho stack?
-
-Stack chỉ dùng 1 mutex. Tại sao không áp dụng "fine-grained" cho stack?
-
-- (a) Stack có dummy-node trick được không? Nếu được, dummy ở đâu — đỉnh hay đáy? Phân tích.
-- (b) Nếu cố tách: top_mutex và bottom_mutex — bottom có ai access không? Hệ quả về concurrency là gì?
-- (c) Kết luận về cấu trúc nào "bẩm sinh" friendlier với fine-grained locking, và tại sao queue thắng stack ở đây.
+1. Tại sao dummy node giải quyết được vấn đề `push` và `pop` cùng truy cập `head->next` / `tail->next` trên cùng một node? Trace trường hợp queue 1 phần tử **không có** dummy node.
+2. Tại sao `get_tail()` phải được gọi **bên trong** scope của `head_mutex`? Nếu gọi ngoài, viết interleaving 2 thread gây sai.
+3. `push()` thực hiện allocation ngoài lock — điều này cải thiện concurrency cụ thể như thế nào so với `std::queue`-based implementation?
+4. Giải thích tại sao `tail` là raw pointer mà `head` là `unique_ptr`. Nếu đổi `tail` thành `unique_ptr` thì sao?
 
 ---
 
-## (3) Skeleton + intentional bugs
+## Bài 9 🔴 — `blocking_fine_queue<T>`: Thêm wait_and_pop + shutdown lên fine-grained queue
 
-> **Format**: code có chú thích `// SUSPICIOUS` ở những vùng nghi vấn (số bug được công bố ở đầu mỗi bài). Học viên: chạy thử với TSan, mô tả interleaving cụ thể gây sai, sửa, trả lời analysis questions.
->
-> Compile: `g++ -std=c++17 -pthread -g -fsanitize=thread -O1 file.cpp -o test`
+### Đặc tả hành vi
 
-### B1 🟡 — Stack với check-then-act gãy (1 bug)
+Mở rộng `fine_queue` (Bài 8) thành `blocking_fine_queue<T>` với blocking interface:
 
-```cpp
-template<typename T>
-class threadsafe_stack {
-    mutable std::mutex m;
-    std::stack<T> data;
-public:
-    bool empty() const {
-        std::lock_guard<std::mutex> lk(m);
-        return data.empty();
-    }
-
-    // SUSPICIOUS
-    std::shared_ptr<T> pop() {
-        if (empty()) {
-            return nullptr;
-        }
-        std::lock_guard<std::mutex> lk(m);
-        auto res = std::make_shared<T>(std::move(data.top()));
-        data.pop();
-        return res;
-    }
-
-    void push(T v) {
-        std::lock_guard<std::mutex> lk(m);
-        data.push(std::move(v));
-    }
-};
+```
+push(T value)
+try_pop() -> std::shared_ptr<T>
+try_pop(T& out) -> bool
+wait_and_pop() -> std::shared_ptr<T>
+wait_and_pop(T& out)
+empty() -> bool
+shutdown()
 ```
 
-Câu hỏi:
-- Bug ở đâu? Đặt tên (interface race / TOCTOU / lock-not-held / …).
-- Dựng interleaving cụ thể (2 threads, 1 element trong stack) khiến `pop()` crash hoặc UB.
-- Sửa thế nào để KHÔNG mất concurrency với `push()`? (Gợi ý: chap 3 đã cover, nhưng fix lần này phải nói rõ tại sao trả `nullptr` vs throw `empty_stack` là 2 lựa chọn API.)
+`wait_and_pop()`:
+- Block nếu queue rỗng. Thread phải ngủ thật (condition variable), không busy-wait.
+- Predicate: `head.get() != get_tail()` (queue không rỗng) **hoặc** shutdown flag đã set.
+- Nếu được unblock do shutdown và queue vẫn rỗng: ném `queue_shutdown` exception.
 
-### B2 🔴 — Fine-grained queue (2 bugs)
+`shutdown()`:
+- Set flag, `notify_all()`.
+- Sau shutdown: `push()` ném `queue_shutdown`. `try_pop()` vẫn hoạt động bình thường cho đến khi queue cạn.
 
-```cpp
-template<typename T>
-class threadsafe_queue {
-    struct node {
-        std::shared_ptr<T> data;
-        std::unique_ptr<node> next;
-    };
-    std::mutex head_mutex, tail_mutex;
-    std::unique_ptr<node> head;
-    node* tail;
+**Exception safety trong wait_and_pop():**
+- Overload `wait_and_pop(T& out)` phải thực hiện `value = std::move(*head->data)` **trước** khi remove node khỏi list. Nếu copy/move throw, node vẫn còn trong queue.
 
-    node* get_tail() {
-        std::lock_guard<std::mutex> lk(tail_mutex);
-        return tail;
-    }
+### Ràng buộc cứng
 
-    // SUSPICIOUS
-    std::unique_ptr<node> pop_head() {
-        node* const old_tail = get_tail();
-        std::lock_guard<std::mutex> lk(head_mutex);
-        if (head.get() == old_tail) return nullptr;
-        auto old_head = std::move(head);
-        head = std::move(old_head->next);
-        return old_head;
-    }
+- Dùng `std::condition_variable` + `head_mutex` cho wait.
+- `notify_one()` trong `push()`, `notify_all()` trong `shutdown()`.
+- `notify_one()` phải được gọi **sau** khi đã release `tail_mutex` — giải thích tại sao.
+- Vẫn giữ hai mutex tách biệt như Bài 8.
 
-public:
-    threadsafe_queue() : head(new node), tail(head.get()) {}
+### Invariant cần giữ
 
-    std::shared_ptr<T> try_pop() {
-        auto old_head = pop_head();
-        return old_head ? old_head->data : nullptr;
-    }
+Tất cả invariant của Bài 8, cộng thêm:
+- Sau `shutdown()`, mỗi thread đang block ở `wait_and_pop` phải eventually được unblock.
+- Không element nào bị mất: mọi element đã push trước shutdown đều pop được.
 
-    // SUSPICIOUS
-    void push(T new_value) {
-        auto new_data = std::make_shared<T>(std::move(new_value));
-        std::unique_ptr<node> p(new node);
-        std::lock_guard<std::mutex> lk(tail_mutex);
-        node* const new_tail = p.get();
-        tail->next = std::move(p);  // <-- thứ tự?
-        tail->data = new_data;
-        tail = new_tail;
-    }
-};
+### Bài test bắt buộc
+
+**Test 1 — Normal flow:** 3 producers × 1000 items, 5 consumers dùng `wait_and_pop`. Khi đủ 3000 items consumed, main thread gọi `shutdown()`. Verify: tổng giá trị đúng, không thread nào bị block mãi.
+
+**Test 2 — Shutdown unblocks waiters:** Launch 5 consumer threads trước khi có bất kỳ producer nào. Tất cả 5 threads phải block. Sau 100ms, gọi `shutdown()`. Tất cả 5 threads phải catch `queue_shutdown` và kết thúc trong vòng 200ms.
+
+**Test 3 — Exception safety:** Push 10 items. Pop 5 bằng `try_pop`. Pop item 6 bằng `wait_and_pop(T&)` với `T` có copy/move constructor throw exception. Queue phải vẫn còn đúng 5 items.
+
+### Debug checkpoint
+
+- `wait_for_data()` helper function phải return `std::unique_lock<std::mutex>` — tại sao không phải `lock_guard`?
+- Nếu `notify_one()` trong `push()` được gọi khi `tail_mutex` vẫn đang lock: thread consumer wakeup, cần lock `head_mutex`, rồi trong predicate gọi `get_tail()` cần lock `tail_mutex` → có bị block không?
+- Nếu dùng `notify_one()` trong `shutdown()` thay vì `notify_all()` — 4/5 consumer threads sẽ block mãi.
+
+### Câu hỏi phân tích
+
+1. `wait_for_data()` trả `std::unique_lock` qua return — giải thích flow ownership của lock từ `wait_for_data()` → `wait_pop_head()` → caller.
+2. Tại sao không dùng `data_cond.wait(lk, [&]{ return !empty(); })` làm predicate? (Hint: `empty()` acquire lock riêng.)
+3. Khi exception xảy ra trong `wait_and_pop()` (ví dụ `make_shared` throw), thread đó không gọi `notify_one()` → thread khác đang chờ sẽ bỏ lỡ notification. Giải pháp là gì?
+4. So sánh thiết kế này với `threadsafe_queue` single-mutex (Bài 5 cũ): concurrency đạt được ở những điểm cụ thể nào?
+
+---
+
+# PHẦN B — Hash Map với Per-Bucket Locking
+
+---
+
+## Bài 10 🟡 — `concurrent_map<K,V>`: Thread-safe hash map với per-bucket `shared_mutex`
+
+### Đặc tả hành vi
+
+Viết class template `concurrent_map<K,V,Hash>` dựa trên hash table cố định số bucket, mỗi bucket được bảo vệ bởi `std::shared_mutex` riêng.
+
+Interface:
+
+```
+Value get(Key const& key, Value const& default_value = Value()) const
+void put(Key const& key, Value const& value)       // add hoặc update
+bool remove(Key const& key)                         // trả về true nếu đã xóa
+std::map<Key,Value> snapshot() const                 // copy toàn bộ state
+size_t size() const                                  // tổng số entries
 ```
 
-Câu hỏi:
-- Bug 1 (`pop_head`): mô tả kịch bản 3 threads (mỗi thread label hành động trên đường đi). Trạng thái sau interleaving là gì? Invariant nào bị vỡ?
-- Bug 2 (`push`): đảo `tail->data = new_data` xuống dưới `tail->next = std::move(p)`. Vấn đề là gì? **Hint**: thread consumer thấy được node mới ngay khi `next` được gán, nhưng `data` chưa kịp set. Vẽ trace cụ thể.
-- Sửa từng bug và **chạy lại với TSan** để xác nhận không còn warning. Câu hỏi: TSan có bắt được CẢ HAI bug không? Bug nào TSan có thể miss và vì sao?
+Thiết kế nội bộ:
+- Số bucket cố định khi construct (mặc định 19, prime number).
+- Mỗi bucket là một `std::list<std::pair<Key,Value>>`, có `std::shared_mutex` riêng.
+- `get()` dùng `shared_lock` (cho phép nhiều reader đồng thời trên cùng bucket).
+- `put()` và `remove()` dùng `unique_lock`.
+- `snapshot()` lock **tất cả** bucket theo thứ tự index tăng dần, rồi copy.
 
-### B3 🔴 — Hash bucket với primitive sai (3 bugs)
+### Ràng buộc cứng
 
-```cpp
-class bucket_type {
-    using bucket_value = std::pair<Key, Value>;
-    std::list<bucket_value> data;
-    mutable std::shared_mutex mutex;
+- **Không dùng `std::unordered_map`** hay bất kỳ associative container nào bên trong. Tự quản lý bucket + list.
+- Bucket count cố định — không rehash.
+- `Hash` là template parameter mặc định `std::hash<K>`.
+- Buckets được lưu trong `std::vector<std::unique_ptr<bucket_type>>` — giải thích tại sao `unique_ptr` chứ không phải trực tiếp `bucket_type`.
 
-    auto find_entry_for(Key const& k) const {
-        return std::find_if(data.begin(), data.end(),
-            [&](auto const& e){ return e.first == k; });
-    }
+### Invariant cần giữ
 
-public:
-    // SUSPICIOUS
-    Value value_for(Key const& k, Value const& def) const {
-        std::unique_lock<std::shared_mutex> lk(mutex);
-        auto it = find_entry_for(k);
-        return it == data.end() ? def : it->second;
-    }
+- Mỗi key xuất hiện tối đa một lần trong toàn bộ map.
+- `get_bucket(key)` luôn trả về cùng một bucket cho cùng key (deterministic hash).
+- `snapshot()` trả về consistent view: không thấy nửa operation nào.
 
-    // SUSPICIOUS
-    void add_or_update(Key const& k, Value const& v) {
-        std::shared_lock<std::shared_mutex> lk(mutex);
-        auto it = find_entry_for(k);
-        if (it == data.end()) data.push_back({k, v});
-        else it->second = v;
-    }
+### Bài test bắt buộc
 
-    // SUSPICIOUS
-    void remove(Key const& k) {
-        auto it = find_entry_for(k);
-        std::unique_lock<std::shared_mutex> lk(mutex);
-        if (it != data.end()) data.erase(it);
-    }
-};
+**Test 1 — Concurrent read/write:** 4 writer threads, mỗi thread `put` 10,000 key-value pairs (keys = thread_id * 10000 + i). 4 reader threads, mỗi thread `get` các key ngẫu nhiên trong phạm vi tổng. Không data race.
+
+**Test 2 — Concurrent put + remove:** 2 writer threads put, 2 remover threads remove cùng range. Sau khi join: `snapshot()` phải consistent (mỗi key hoặc tồn tại hoặc không, không có partial state).
+
+**Test 3 — Snapshot consistency:** Thread A liên tục `put(1, v++)`. Thread B gọi `snapshot()` lặp lại. Mỗi snapshot phải thấy đúng 1 entry cho key 1 với một giá trị cụ thể — không bao giờ thấy key 1 hai lần hay thiếu.
+
+### Debug checkpoint
+
+- `snapshot()` lock tất cả bucket — nếu lock không theo thứ tự cố định → deadlock khi hai thread gọi `snapshot()` đồng thời.
+- Nếu dùng `bucket_type` trực tiếp trong vector (không qua `unique_ptr`): `std::shared_mutex` không moveable → vector không thể resize (kể cả khi bạn không resize, constructor sẽ fail).
+- `find_entry_for()` helper dùng `std::find_if` trên bucket list — hàm này phải nhận `Key const&`, không copy key.
+
+### Câu hỏi phân tích
+
+1. Tại sao hash table được chọn thay vì binary tree hay sorted array cho fine-grained locking? Phân tích access pattern của từng cấu trúc.
+2. `get()` dùng `shared_lock`, `put()` dùng `unique_lock` — nếu 10 thread cùng `get` trên cùng bucket, bao nhiêu thread chạy đồng thời? Nếu 1 thread `put` và 9 thread `get` trên cùng bucket thì sao?
+3. `snapshot()` phải lock tất cả bucket — đây là operation duy nhất cần multiple locks. Giải thích tại sao lock theo index tăng dần là đủ để ngăn deadlock.
+4. Nếu cho phép rehash (tăng số bucket khi load factor cao), concurrency bị ảnh hưởng thế nào? Cần thêm cơ chế đồng bộ gì?
+
+---
+
+## Bài 11 🔴 — `lru_concurrent_cache<K,V>`: LRU eviction trên concurrent hash map
+
+### Đặc tả hành vi
+
+Kết hợp `concurrent_map` (Bài 10) với LRU (Least Recently Used) eviction policy.
+
+Interface:
+
+```
+// Constructor: max_entries là capacity
+lru_concurrent_cache(size_t max_entries, size_t num_buckets = 19)
+
+std::optional<Value> get(Key const& key)        // trả về value + đánh dấu recently used
+void put(Key const& key, Value const& value)    // insert/update + evict LRU nếu full
+bool remove(Key const& key)
+size_t size() const
 ```
 
-Câu hỏi:
-- Bug 1 (`value_for`): tại sao `unique_lock` ở read path là tệ về performance NHƯNG đúng về correctness? (Trick câu hỏi.)
-- Bug 2 (`add_or_update`): `shared_lock` cho write path là **sai**. Thiệt hại cụ thể là gì? `std::list` modification trong khi reader khác đang iterate gây UB như thế nào?
-- Bug 3 (`remove`): TOCTOU — `find_entry_for` chạy ngoài lock, lock acquire muộn. Iterator có thể đã invalid. Mô tả interleaving với 2 threads cùng `remove(k)`.
-- Sửa cả 3, sau đó chạy stress test 4 threads × 1M ops mỗi thread.
+Hành vi LRU:
+- Mỗi lần `get()` hoặc `put()` thành công trên một key, key đó được đánh dấu là "most recently used".
+- Khi `put()` gây vượt capacity, entry "least recently used" bị evict trước khi insert entry mới.
+- Eviction phải thread-safe và không gây deadlock.
+
+### Ràng buộc cứng
+
+- Dùng hash map (tương tự Bài 10) cho O(1) lookup.
+- Dùng một doubly-linked list riêng để track thứ tự access (LRU order).
+- LRU list cần mutex riêng, tách biệt với bucket mutexes.
+- **Không dùng `std::unordered_map`** — tự quản lý.
+- Eviction trong `put()` phải release bucket lock trước khi acquire LRU lock (nếu cần) để tránh lock ordering violation.
+
+### Invariant cần giữ
+
+- `size() <= max_entries` luôn đúng.
+- Mỗi key trong hash map có đúng một node tương ứng trong LRU list và ngược lại.
+- Entry bị evict luôn là entry ít được truy cập nhất (tail của LRU list).
+
+### Bài test bắt buộc
+
+**Test 1 — Eviction correctness:** Cache capacity = 100. Insert keys 0–199 tuần tự. Sau đó `get(0)` phải trả về `nullopt` (đã bị evict), `get(100)` phải có giá trị (chưa bị evict).
+
+**Test 2 — Concurrent put + eviction:** 4 threads, mỗi thread `put` 10,000 entries vào cache capacity = 5000. Tại mọi thời điểm `size() <= 5000`. Sau khi join: `size() <= 5000`.
+
+**Test 3 — get promotes access order:** Insert keys 0–99 (capacity = 100). `get(0)` rồi `put(100, v)`. Key 1 phải bị evict (LRU), key 0 phải còn tồn tại (vừa được access).
+
+### Debug checkpoint
+
+- Lock ordering: nếu hold bucket lock rồi acquire LRU lock, thread khác hold LRU lock rồi acquire bucket lock (trong eviction) → **deadlock**. Phải thiết kế protocol rõ ràng.
+- Eviction cần: (1) lock LRU list → lấy victim key → unlock LRU list → (2) lock victim's bucket → remove entry → unlock bucket → (3) lock LRU list → remove LRU node. Giữa bước 1 và 2, thread khác có thể access victim key → phải check lại.
+- `size()` cần đồng bộ — nếu dùng `std::atomic<size_t>`, increment/decrement phải diễn ra đúng thời điểm.
+
+### Câu hỏi phân tích
+
+1. Thiết kế lock ordering protocol: liệt kê tất cả mutex trong hệ thống và thứ tự acquire cho từng operation (`get`, `put`, `put+evict`, `remove`).
+2. Trong eviction, giữa lúc chọn victim (LRU tail) và lúc xóa victim khỏi bucket, thread khác có thể `get(victim_key)` → promote victim lên MRU. Thiết kế của bạn xử lý race này thế nào?
+3. So sánh "global LRU lock" vs "per-bucket LRU" — trade-off giữa correctness, performance, và complexity.
+4. Nếu eviction cần xóa entry đang được thread khác `get()` đọc, `shared_ptr` giúp gì ở đây?
 
 ---
 
-## (4) From-scratch — không skeleton
+# PHẦN C — Hand-Over-Hand Locking
 
-### S1 🟡 — Bounded queue dựa trên listing 6.6
+---
 
-Yêu cầu:
-- Constructor nhận `size_t capacity`. `push()` block khi đầy, `try_push()` trả `false` ngay.
-- Vẫn giữ tách `head_mutex` / `tail_mutex`.
-- Hai condition variable: `not_full`, `not_empty`. Mỗi cv gắn với mutex nào?
-- Counter `current_size` lưu ở đâu? Bảo vệ bằng gì? Có cần `std::atomic`?
+## Bài 12 🟡 — `fine_list<T>`: Linked list với per-node locking
 
-Câu hỏi phân tích sau khi viết:
-- Có thể dùng 1 cv duy nhất không? Tại sao 2 hợp lý hơn?
-- `notify_one` của `not_full` được gọi ở chỗ nào trong `try_pop`?
-- Edge case: capacity = 0. Code có đúng không? Có ý nghĩa không?
-- Edge case: capacity = 1. So với 1 mutex bao quát thì có lợi gì không?
+### Đặc tả hành vi
 
-### S2 🔴 — Concurrent priority queue
+Viết class template `fine_list<T>` — singly linked list với mutex trên mỗi node, hỗ trợ concurrent traversal bằng kỹ thuật **hand-over-hand locking** (lock coupling).
 
-Yêu cầu:
-- API: `push(T, priority)`, `wait_and_pop()` (lấy phần tử priority cao nhất).
-- Internal: `std::priority_queue<...>` được phép.
+Interface:
 
-Câu hỏi PHẢI trả lời trong comment đầu file:
-- Vì sao priority queue **không thể** fine-grained như queue thường?
-- Trade-off so với 2 single-end queues: có giải pháp nào tốt hơn `std::priority_queue` + 1 mutex cho workload write-heavy?
-- Bài này thực sự là về **nhận ra giới hạn** của lock-based fine-grained design. Nói rõ lý do trong commentary.
-
-### S3 🔴 — `get_or_compute(key, factory)` cho lookup table
-
-Mở rộng listing 6.11 thêm hàm:
-```cpp
-Value get_or_compute(Key const& k, std::function<Value()> factory);
 ```
-Hợp đồng:
-- Nếu key tồn tại → trả value hiện tại.
-- Nếu không → gọi `factory()` đúng 1 lần (kể cả khi 100 threads cùng yêu cầu cùng key đó), lưu, trả.
-- `factory()` có thể **chậm** (vài giây — ví dụ DNS lookup, file read). KHÔNG được giữ lock toàn bucket trong lúc factory chạy.
+void push_front(T const& value)
 
-Hint:
-- Naive: lock unique → check → factory() → insert → unlock. Vấn đề: 100 threads bị serialize hoàn toàn ở bucket đó.
-- Tốt hơn: per-key promise/future hoặc per-key `call_once` flag. Cấu trúc cụ thể thế nào?
-- Edge: factory throw exception → state là gì? Threads khác đang chờ thấy gì?
+template<typename F>
+void for_each(F fn)
 
-Câu hỏi sau khi viết:
-- Liệt kê **3 race condition** có thể xảy ra trong implementation đầu tiên của bạn và cách fix.
-- So sánh với `folly::Singleton` hay `absl::call_once` (chỉ cần kể tên kỹ thuật).
+template<typename P>
+std::shared_ptr<T> find_first_if(P predicate)
 
----
+template<typename P>
+void remove_if(P predicate)
 
-## (5) Checklist — Safety / Liveness / Performance
+bool empty() const
+size_t size() const
+```
 
-Áp dụng cho mọi cấu trúc lock-based bạn viết hoặc review.
+Kỹ thuật hand-over-hand:
+- Khi traverse list: lock node hiện tại → lock node tiếp theo → unlock node hiện tại → tiến tới. Tại mọi thời điểm, luôn giữ lock trên ít nhất một node.
+- Head là **sentinel node** (dummy) không chứa data, chỉ giữ mutex cho entry point.
+- Data trong mỗi node lưu bằng `std::shared_ptr<T>`.
 
-### Safety (correctness)
+### Ràng buộc cứng
 
-- [ ] **S1**. Mỗi shared mutable data được bảo vệ bởi đúng 1 mutex (hoặc tập mutex xác định). Liệt kê được mapping data → mutex.
-- [ ] **S2**. Không có raw pointer/reference vào internal data thoát ra ngoài qua return value (trừ khi có ownership transfer rõ ràng — `shared_ptr`/`unique_ptr`).
-- [ ] **S3**. Không có check-then-act mà giữa check và act mutex bị release.
-- [ ] **S4**. User-supplied callbacks (như `for_each(f)`) được gọi với mutex giữ — đã hiểu deadlock risk và đã document.
-- [ ] **S5**. Exception safety: với mỗi member function viết được phân tích "throw point → state → guarantee".
-- [ ] **S6**. Move/copy operations không leak invariant nội bộ (ví dụ: copy ctor lock source mutex trước khi đọc).
+- Mỗi node có `std::mutex` riêng.
+- Dùng `std::unique_lock` (không phải `lock_guard`) — vì cần unlock thủ công.
+- `push_front()` chỉ lock head's mutex.
+- `for_each()`, `find_first_if()`, `remove_if()` đều dùng hand-over-hand.
+- Destructor phải xóa tất cả nodes — dùng `remove_if([](auto&){return true;})`.
 
-### Liveness (no deadlock / no starvation)
+### Invariant cần giữ
 
-- [ ] **L1**. Lock ordering nhất quán nếu có >1 mutex giữ đồng thời. Document order.
-- [ ] **L2**. Không lock được giữ qua I/O / sleep / call ngoài tầm kiểm soát.
-- [ ] **L3**. `notify_one` đủ — hoặc bắt buộc dùng `notify_all` (lý do). Predicate đảm bảo no missed wakeup.
-- [ ] **L4**. `shared_mutex` có chính sách tránh writer starvation hợp lý (implementation defined — biết platform).
-- [ ] **L5**. Nếu có blocking `wait_*`, có cơ chế cancel/timeout (hoặc đã chấp nhận hệ quả).
+- Traversal luôn đi một chiều (head → tail), luôn lock next trước khi unlock current → **không deadlock**.
+- Nhiều thread có thể traverse đồng thời, miễn đang ở các node khác nhau.
+- `remove_if` xóa node `N`: phải hold lock trên node trước `N` để ngăn thread khác đến `N`.
 
-### Performance
+### Bài test bắt buộc
 
-- [ ] **P1**. Critical section nhỏ nhất có thể. Memory allocation/deallocation NẰM NGOÀI lock.
-- [ ] **P2**. Read path dùng `shared_lock` khi workload read-heavy. Đo trước khi tin.
-- [ ] **P3**. False sharing giữa các mutex/atomic được kiểm tra (alignment 64B / `alignas(std::hardware_destructive_interference_size)`).
-- [ ] **P4**. Số mutex tỉ lệ với contention thực — không over-engineer (1 mutex/node hợp lý cho list lớn, vô lý cho list 5 phần tử).
-- [ ] **P5**. Notification không lãng phí: `notify_one` thay vì `notify_all` nếu chỉ 1 waiter cần wake.
-- [ ] **P6**. Fast path không lock nếu được (ví dụ: snapshot count với `atomic<size_t>` cho `empty()`).
+**Test 1 — Concurrent push + for_each:** 4 threads push 1000 items mỗi thread. Đồng thời 2 threads chạy `for_each` đếm elements. Không crash, không data race.
 
----
+**Test 2 — Concurrent remove + find:** Push 10,000 items (values 0–9999). 2 threads `remove_if(x < 5000)`. 2 threads `find_first_if(x == 7777)`. Sau khi join: tất cả items < 5000 đã bị xóa, items ≥ 5000 còn nguyên.
 
-## (6) Short oral — interview rapid fire
+**Test 3 — Ordering safety:** 3 threads cùng `remove_if` với các predicate khác nhau trên cùng list. Không deadlock, không double-free, không missing elements.
 
-Trả lời mỗi câu **≤ 30 giây**, English keyword summary cho phần bold.
+### Debug checkpoint
 
-1. **Why dummy node** in fine-grained queue?
-2. Vì sao `tail` là `node*` raw, còn `head` là `unique_ptr<node>`?
-3. **Why prime number of buckets** in hash table?
-4. `std::shared_mutex` writer starvation — concrete scenario?
-5. Vì sao stack chỉ cần 1 mutex còn queue tách được 2?
-6. **Hand-over-hand locking** — định nghĩa trong 1 câu?
-7. `notify_one` vs `notify_all` — chọn sai gây hại gì?
-8. Vì sao predicate trong `cv.wait(lk, pred)` phải idempotent (gọi nhiều lần OK)?
-9. Exception trong `push()` listing 6.8 → strong guarantee đến từ đâu?
-10. **Per-bucket lock** vs single lock — break-even point khi nào (qualitative)?
-11. Vì sao thread-safe map listing 6.11 KHÔNG cung cấp iterator?
-12. `get_map()` snapshot consistent — atomic theo nghĩa nào?
-13. Trong list listing 6.13, `remove_if` xoá node trong khi iterator khác đang trỏ vào nó — có happen được không, và vì sao?
-14. **Coarse-grained vs fine-grained** locking — 1 câu trade-off.
-15. Lock-based queue có cần `std::atomic` member nào không? Vì sao không?
+- Trong `remove_if`: sau khi xóa node, **không** advance `current` pointer — phải check node mới tại vị trí cũ (vì `current->next` đã đổi).
+- Xóa node = move `current->next` vào local variable, rồi gán `current->next = old_next->next`. Node bị xóa khi `unique_ptr` local ra khỏi scope. **Phải unlock** node bị xóa trước khi nó bị destroy — destroying locked mutex là UB.
+- Verify: lock trên node bị xóa được release **trước** `unique_ptr` destructor chạy. Trong code: `next_lk.unlock()` rồi mới để `old_next` ra khỏi scope.
+
+### Câu hỏi phân tích
+
+1. Hand-over-hand locking đảm bảo no-deadlock bằng cách nào? (Hint: chứng minh total order trên lock acquisition.)
+2. Tại sao threads không thể "vượt" nhau? Thread A ở node 5, thread B ở node 3 — B có thể đến node 5 trước khi A rời không?
+3. `push_front` chỉ lock head — nếu thread A đang `for_each` vừa lock head xong, thread B gọi `push_front`, điều gì xảy ra?
+4. So sánh throughput: fine_list vs single-mutex list khi 8 threads cùng `for_each` trên list 10,000 nodes, mỗi `fn` tốn 1ms. Ước tính lý thuyết.
 
 ---
 
-## (7) Mock interview — 45 phút
+## Bài 13 🔴 — `sorted_fine_list<T>`: Sorted linked list với concurrent insert
 
-### Scenario
+### Đặc tả hành vi
 
-> Bạn đang phỏng vấn vị trí Senior Systems Engineer tại một công ty ad-tech. Interviewer:
->
-> *"We run a real-time bidding service. Every ad impression triggers a lookup against an in-memory feature store: given a `user_id`, return that user's feature vector (~1 KB). The store has ~50M entries, fits in RAM. Read:write ratio is 95:5. Updates come from a stream consumer. Throughput target per node: 200k QPS. Latency p99: <1ms. Single-process, multi-threaded C++ service.*
->
-> *Walk me through the data structure and locking strategy. I'll interrupt with follow-ups."*
+Mở rộng `fine_list` thành **sorted linked list** (tăng dần), hỗ trợ insert đúng vị trí và maintain sorted order dưới concurrent access.
 
-Tự trả lời, ghi audio hoặc viết, theo các sub-questions interviewer SẼ đặt ra dưới đây (đừng đọc trước — trả lời từng cái khi đến):
+Interface:
 
-**Round 1 — Data structure choice (10 phút)**
-- Q1.1: Bạn chọn cấu trúc gì? Vì sao không phải `std::unordered_map` + 1 `shared_mutex`?
-- Q1.2: Bao nhiêu bucket? Cố định hay dynamic? Lý do?
-- Q1.3: 50M entries, 19 bucket → bucket size ~2.6M. Tệ không? Bao nhiêu bucket là hợp lý? (Họ muốn nghe tính toán, không phải số tròn.)
-- Q1.4: Vì sao không dùng concurrent hashmap có sẵn (TBB, folly)?
+```
+void insert(T const& value)             // insert vào đúng vị trí sorted
+bool contains(T const& value) const     // tìm kiếm
+bool remove(T const& value)             // xóa entry đầu tiên bằng value
 
-**Round 2 — Locking & concurrency (15 phút)**
-- Q2.1: Per-bucket `std::shared_mutex`. Read 200k QPS × 95% = 190k read/s. Write 10k/s. Có concurrency thực sự không?
-- Q2.2: Nếu một bucket nóng (1 user_id phổ biến), bucket lock có thành bottleneck không? Cách giảm?
-- Q2.3: Update path: feature vector 1KB. Copy vào trong lock hay swap pointer? Trade-off?
-- Q2.4: **Curveball**: nếu update phải atomic với 2-3 keys liên quan (consistency), bạn handle thế nào? Lock multiple bucket — order ra sao?
+template<typename F>
+void for_each(F fn)                     // traverse sorted order
 
-**Round 3 — Edge & failure (10 phút)**
-- Q3.1: Một thread update cầm lock 50ms vì allocate gây page fault. Hậu quả? Mitigation?
-- Q3.2: Memory budget: 50M × ~1.2KB ≈ 60GB. Process bị restart cần warm-up. Strategy?
-- Q3.3: Bạn cần "atomic snapshot" cho diagnostic dump (toàn bộ store). Như get_map() trong listing 6.12. Có làm được không? Tại sao có thể không nên?
+size_t size() const
+```
 
-**Round 4 — Beyond locks (10 phút)**
-- Q4.1: Ở 200k QPS, lock-based bottleneck ở đâu (theo dự đoán)?
-- Q4.2: Lock-free alternative — Michael-Scott queue style cho insert? Cost của RCU/hazard pointer?
-- Q4.3: Khi nào BẠN sẽ KHÔNG chuyển sang lock-free? (Họ test xem bạn có quá-engineering không.)
+`insert(value)`:
+- Traverse list bằng hand-over-hand locking cho đến khi tìm vị trí đúng: node hiện tại ≤ value < node tiếp theo.
+- Insert node mới giữa current và next.
+- Trong lúc insert, phải hold lock trên **cả** predecessor và successor.
 
-### Đánh giá tự bản thân sau khi xong
+### Ràng buộc cứng
 
-| Tiêu chí                           | 1 (kém) – 5 (tốt) | Note                          |
-|------------------------------------|-------------------|-------------------------------|
-| Hiểu rõ trade-off coarse vs fine   |                   |                               |
-| Tính toán bucket count có cơ sở    |                   |                               |
-| Phân tích contention realistic     |                   |                               |
-| Edge case awareness                |                   |                               |
-| Biết khi nào DỪNG optimize         |                   |                               |
-| Communicate rõ ràng dưới áp lực    |                   |                               |
+- Sorted order (ascending) dùng `operator<` trên `T`.
+- Insert phải dùng hand-over-hand + lock predecessor khi chèn.
+- Không dùng `std::set`, `std::list` (ngoài internal node struct).
+- Giữ sentinel head (data-less) như `fine_list`.
+- `T` phải là `CopyConstructible` và `LessThanComparable`.
 
----
+### Invariant cần giữ
 
-## Phụ lục — bug pattern bingo card cho lock-based DS
+- Tại mọi thời điểm mà không có thread nào đang hold lock, list ở trạng thái sorted.
+- Concurrent inserts không phá vỡ sorted order — kể cả khi hai thread insert vào cùng vị trí.
+- `remove(value)` xóa đúng **một** occurrence đầu tiên.
 
-Khi review code lock-based, scan tìm 10 anti-pattern sau:
+### Bài test bắt buộc
 
-1. **Check-then-act outside lock**: `if (empty()) ...` rồi mới lock.
-2. **Returning reference to internal data**: `T& front()` không có ownership transfer.
-3. **Lock held over user callback**: `for_each(f)` gọi `f` trong lock → user lock khác → deadlock.
-4. **Holding lock during slow op**: I/O, allocation lớn, sleep, system call.
-5. **Wrong lock type**: `unique_lock` ở pure-read path, `shared_lock` ở write path.
-6. **Iterator invalidation across lock release**: lưu iterator, unlock, lock lại, dùng iterator.
-7. **TOCTOU on container size**: `if (q.size() < N) q.push(...)` — `size()` cũ.
-8. **Inconsistent lock order**: function A lock(m1, m2), function B lock(m2, m1).
-9. **Missed notification**: predicate không cover hết điều kiện wake.
-10. **`notify_*` while still holding the wrong mutex**: technical correctness OK, performance loss.
+**Test 1 — Concurrent sorted insert:** 8 threads, mỗi thread insert 5000 giá trị ngẫu nhiên (range 0–99999). Sau khi join: `for_each` verify list sorted ascending và `size() == 40000`.
 
-Tự đánh dấu mỗi lần phát hiện trong code review. Mục tiêu: 10/10 trong 6 tháng.
+**Test 2 — Concurrent insert + remove:** 4 threads insert, 4 threads remove giá trị ngẫu nhiên. Sau khi join: list vẫn sorted. Tổng insert - tổng remove thành công = `size()`.
+
+**Test 3 — Duplicate values:** Insert 1000, 1000, 1000 từ 3 threads. `size()` phải = 3. Remove 1000 một lần → `size()` = 2. List vẫn sorted.
+
+### Debug checkpoint
+
+- Insert tại vị trí giữa predecessor và successor: phải hold lock trên **cả hai** để ngăn thread khác insert vào cùng gap. Nếu chỉ lock predecessor → race condition với thread khác cùng chọn gap đó.
+- Insert tại tail (value lớn nhất): successor là nullptr. Không cần lock successor. Nhưng phải verify predecessor vẫn là tail node.
+- Nếu hai threads cùng traverse đến cùng gap (pred → succ), thread A lock trước, insert A giữa pred → succ. Thread B cần re-check vì giờ pred → A → succ. B phải advance qua A.
+
+### Câu hỏi phân tích
+
+1. Insert cần lock cả predecessor và successor — nhưng hand-over-hand chỉ hold 2 locks tại một thời điểm (current + next). Insert thực sự cần bao nhiêu locks? Trace step-by-step.
+2. Nếu cho phép duplicate values, hai threads insert cùng value vào cùng vị trí: trace interleaving và chứng minh sorted order được giữ.
+3. `remove` cần hold lock trên predecessor để thay đổi `predecessor->next`. Nếu không lock predecessor, interleaving nào gây ra bug?
+4. So sánh `sorted_fine_list` vs `concurrent_map` (Bài 10) cho use case "concurrent set": trade-off về lookup time, insert time, memory, và concurrency level.
 
 ---
 
-## Hướng dẫn tự chấm
+# PHẦN D — Bounded Queue (Extension)
 
-| Đợt làm | Kết quả mong đợi                                                   |
-|---------|--------------------------------------------------------------------|
-| Lần 1   | Pass W1–W3 + 4/6 essay E. Skeleton bug có thể cần đọc lại sách.    |
-| Lần 2   | Pass tất cả essay E + cross-chapter C. Skeleton bug tự tìm < 5 phút.|
-| Lần 3   | Mock interview tự trả lời được 80% mà không tra sách.              |
+---
 
-Khi pass lần 3 → đủ điều kiện chuyển sang Chapter 7 (lock-free).
+## Bài 14 🟡 — `bounded_queue<T>`: Queue có capacity limit, back-pressure khi full
+
+### Đặc tả hành vi
+
+Viết class template `bounded_queue<T>` — thread-safe queue với giới hạn số lượng element tối đa. Khi queue đầy, `push` block cho đến khi có chỗ trống.
+
+Interface:
+
+```
+// Constructor
+bounded_queue(size_t capacity)
+
+// Blocking operations
+void push(T value)               // block nếu full, unblock khi có slot trống
+void pop(T& out)                 // block nếu empty, unblock khi có element
+
+// Non-blocking
+bool try_push(T value)           // false nếu full
+bool try_pop(T& out)             // false nếu empty
+
+// Control
+void shutdown()                  // unblock tất cả, fail mọi operation sau đó
+size_t size() const
+size_t capacity() const
+```
+
+`push()` block:
+- Khi `size() == capacity()`, thread gọi `push` phải ngủ (condition variable).
+- Khi thread khác `pop` thành công → notify một thread đang chờ push.
+
+`pop()` block:
+- Khi queue rỗng, thread gọi `pop` phải ngủ.
+- Khi thread khác `push` thành công → notify một thread đang chờ pop.
+
+### Ràng buộc cứng
+
+- Dùng **hai condition variables**: `not_full` (cho push waiters) và `not_empty` (cho pop waiters).
+- Dùng một `std::mutex` (single mutex — không cần fine-grained cho bài này).
+- Bên trong dùng circular buffer hoặc `std::queue` + size counter — tự chọn.
+- `shutdown()` phải unblock **cả** push waiters và pop waiters.
+
+### Invariant cần giữ
+
+- `0 <= size() <= capacity()` luôn đúng.
+- Mỗi `push` thành công tăng size đúng 1, mỗi `pop` thành công giảm size đúng 1.
+- FIFO ordering: elements pop ra theo thứ tự push vào.
+
+### Bài test bắt buộc
+
+**Test 1 — Back-pressure:** Capacity = 5. Producer thread push 100 items với sleep 0ms. Consumer thread pop với sleep 10ms. Queue size không bao giờ vượt 5. Producer phải bị block phần lớn thời gian.
+
+**Test 2 — Balanced throughput:** Capacity = 50. 3 producers × 10,000 items. 3 consumers pop liên tục. Sau khi đủ 30,000 items consumed: `shutdown()`. Tổng giá trị đúng.
+
+**Test 3 — Shutdown unblocks both sides:** Capacity = 5. Fill queue đầy (5 items). Launch producer thread (sẽ block vì full). Launch consumer thread trên empty aux queue (sẽ block vì empty). Gọi `shutdown()` — cả hai threads phải unblock và kết thúc.
+
+### Debug checkpoint
+
+- Hai condition variables cùng dùng một mutex — điều này hợp lệ trong C++. Cả hai `wait()` đều lock cùng mutex.
+- `push()` trong predicate phải check cả `shutdown_flag` — nếu không, shutdown sẽ không unblock push waiters.
+- Sau `pop()` thành công, gọi `not_full.notify_one()` để đánh thức push waiter. Nếu quên → producer block mãi khi queue đã từng full.
+
+### Câu hỏi phân tích
+
+1. Tại sao cần **hai** condition variables? Nếu dùng một condition variable cho cả push waiters và pop waiters, vấn đề gì xảy ra? (Hint: `notify_one()` đánh thức sai loại waiter.)
+2. Bounded queue cung cấp "back-pressure" — giải thích điều này ngăn chặn vấn đề gì trong producer-consumer pattern so với unbounded queue.
+3. Nếu dùng `notify_all()` thay vì `notify_one()` trong `push()` cho `not_empty`: performance bị ảnh hưởng thế nào khi có 100 consumer threads?
+4. Circular buffer vs `std::queue` bên trong — trade-off memory allocation, cache locality, và implementation complexity.
+
+---
+
+# Thứ tự làm đề xuất
+
+```
+Bài 8  (Fine-grained queue — foundation)
+    ↓
+Bài 9  (Blocking fine queue — extends Bài 8)
+    ↓
+Bài 12 (Hand-over-hand list — new technique)
+    ↓
+Bài 10 (Concurrent hash map — per-bucket locking)
+    ↓
+Bài 14 (Bounded queue — dual condition variable)
+    ↓
+Bài 13 (Sorted list — hard, extends Bài 12)
+    ↓
+Bài 11 (LRU cache — synthesis, hardest)
+```
+
+---
+
+# Checklist "done" cho mỗi bài
+
+- [ ] Compile sạch với `-Wall -Wextra`
+- [ ] Chạy sạch với `-fsanitize=thread` (không có data race report)
+- [ ] Chạy sạch với `-fsanitize=address` (không có memory error)
+- [ ] Tất cả test cases pass, bao gồm exception paths
+- [ ] Có thể trả lời tất cả câu hỏi phân tích bằng lời, không nhìn code
+- [ ] Có thể trace worst-case interleaving mà thiết kế vẫn đúng
+- [ ] Giải thích được lock ordering và chứng minh no-deadlock cho design
