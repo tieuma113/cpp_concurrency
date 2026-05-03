@@ -1,26 +1,3 @@
-# Bài tập thực hành — C++ Concurrency in Action (Ch. 6)
-# Designing Lock-Based Concurrent Data Structures
-> Tự thiết kế & implement từ đầu đến cuối.  
-> Build: `g++ -std=c++17 -pthread -g -fsanitize=thread -fsanitize=address`
-
----
-
-## Cách dùng bộ bài tập này
-
-Mỗi bài có:
-- **Đặc tả hành vi** — mô tả chính xác hệ thống phải làm gì
-- **Ràng buộc cứng** — những gì bắt buộc hoặc cấm
-- **Invariant cần giữ** — tính đúng đắn được định nghĩa thế nào
-- **Debug checkpoint** — những điểm thường sai, để kiểm tra sau khi xong
-- **Câu hỏi phân tích** — phải trả lời được sau khi implement xong
-
-Không có skeleton code. Không có gợi ý cấu trúc class.
-Tự thiết kế interface trước khi viết implementation.
-
-**Lưu ý:** Bộ bài tập này KHÔNG trùng với bộ Ch. 2–4. Các bài ở đây tập trung vào kỹ thuật đặc trưng của Ch. 6: fine-grained locking, dummy node separation, per-bucket locking, và hand-over-hand locking.
-
----
-
 # PHẦN A — Fine-Grained Locking Queue
 
 ---
