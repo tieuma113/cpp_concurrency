@@ -75,6 +75,7 @@
 #include <atomic>
 #include <chrono>
 #include <exception>
+#include <functional>
 #include <iostream>
 #include <memory>
 #include <mutex>
@@ -106,7 +107,9 @@ class fine_queue {
         std::shared_ptr<my_node> prev;
         std::shared_ptr<T> value;
         my_node() : next(nullptr), prev(nullptr), value{} {}
-        ~my_node() { LOG("value={} delete", value != nullptr ? *value.get() : -1); }
+        ~my_node() {
+            LOG("value={} delete", value != nullptr ? *value.get() : -1);
+        }
     };
     struct my_holder {
         alignas(std::hardware_destructive_interference_size);
@@ -129,9 +132,7 @@ class fine_queue {
         m_hold_head.m_sptr = m_hold_tail.m_sptr;
     }
 
-    ~fine_queue() {
-        LOG("queue empty {}", empty() == true ? "true" : "false");
-    }
+    ~fine_queue() { LOG("queue empty {}", empty() == true ? "true" : "false"); }
     void push(const T value) {
         LOG("push value {}", value);
         std::scoped_lock _lk(m_hold_tail.m_mutex);
@@ -143,8 +144,13 @@ class fine_queue {
         m_hold_tail.m_sptr = temp;
     }
     std::shared_ptr<T> try_pop() {
-        if (empty()) throw my_exception("empty queue");
-        std::scoped_lock _lk(m_hold_head.m_mutex);
+        std::scoped_lock<std::mutex> _lk_head(m_hold_head.m_mutex);
+        {
+            std::scoped_lock<std::mutex> _lk_tail(m_hold_tail.m_mutex);
+            if (m_hold_head.m_sptr == m_hold_tail.m_sptr)
+                throw my_exception("empty queue");
+        }
+
         auto ret = m_hold_head.m_sptr->value;
         m_hold_head.m_sptr = m_hold_head.m_sptr->next;
         m_hold_head.m_sptr->prev = nullptr;
@@ -153,39 +159,52 @@ class fine_queue {
     }
     // bool try_pop(T& out);
     bool empty() {
-        std::scoped_lock _lk(m_hold_head.m_mutex,
-                                         m_hold_tail.m_mutex);
         if (m_hold_head.m_sptr == m_hold_tail.m_sptr) return true;
         return false;
     }
 };
 
-constexpr int input = 1000;
-
+constexpr int INPUT = 50000;
+constexpr int NUMBER_OF_PRODUCER = 4;
+constexpr int NUMBER_OF_CONSUMER = 4;
+void run_input(fine_queue<int>& test, std::atomic<int>& flag,
+               std::atomic<int>& count) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    for (int i = 0; i < INPUT; ++i) {
+        test.push(i);
+        count.fetch_add(1);
+    }
+    flag.fetch_add(1);
+    count.fetch_sub(1);
+}
+void run_output(fine_queue<int>& test, std::atomic<int>& flag,
+                std::atomic<int>& count) {
+    while (count.load() != -4 || flag.load() < 4) {
+        LOG("count = {}", count.load());
+        try {
+            test.try_pop();
+            count.fetch_sub(1);
+        } catch (const std::exception& e) {
+            LOG(e.what());
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
+    }
+}
 int main() {
     fine_queue<int> test;
-    std::atomic<int> count = 1; 
-    std::atomic<bool> flag = false;
-    std::jthread jth_input([&] {
-        std::this_thread::sleep_for(std::chrono::milliseconds(100));
-        for (int i = 0; i < input; ++i) {
-            test.push(i);
-            count.fetch_add(1);
-        }
-        flag.store(true);
-        count.fetch_sub(1);
-    });
-    std::jthread jth_output([&] {
-        while (count.load() != 0 || flag.load() == false) {
-            LOG("count = {}", count.load());
-            try {
-                test.try_pop();
-                count.fetch_sub(1);
-            } catch (const std::exception& e) {
-                LOG(e.what());
-                std::this_thread::sleep_for(std::chrono::milliseconds(100));
-            }
-        }
-    });
+    std::atomic<int> count = 0;
+    std::atomic<int> flag = 1;
+    std::vector<std::jthread> v_producer_thread;
+    v_producer_thread.reserve(4);
+    std::vector<std::jthread> v_consumer_thread;
+    v_consumer_thread.reserve(4);
+    for (int i = 0; i < NUMBER_OF_PRODUCER; ++i) {
+        v_producer_thread.push_back(std::jthread(
+            run_output, std::ref(test), std::ref(flag), std::ref(count)));
+    }
+    for (int i = 0; i < NUMBER_OF_CONSUMER; ++i) {
+        v_producer_thread.push_back(std::jthread(
+            run_input, std::ref(test), std::ref(flag), std::ref(count)));
+    }
     return 0;
 }
